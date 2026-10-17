@@ -218,6 +218,11 @@ namespace Face
 		} else {
 			npc->actorData.actorBaseFlags.reset(RE::ACTOR_BASE_DATA::Flag::kFemale);
 		}
+		// No outfit of its own: the copy came with the settler's, and a stand-in of a friend wearing nothing was dressed
+		// in it by the engine (Equipment::Apply empties it, and the engine put the outfit back on an NPC with nothing on;
+		// StandInGear's check, looking for nothing, never saw it). It wears what the friend wears, or nothing.
+		npc->defOutfit = nullptr;
+		npc->sleepOutfit = nullptr;
 
 		// Head parts: only ones that exist here (same load order, so all should).
 		std::vector<RE::BGSHeadPart*> headParts;
