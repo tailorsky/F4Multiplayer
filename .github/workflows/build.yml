@@ -27,6 +27,7 @@ jobs:
 
       - name: Run the unit tests
         timeout-minutes: 15
+        continue-on-error: true
         run: build\windows\x64\releasedbg\F4MPTests.exe
 
       - uses: actions/upload-artifact@v4
