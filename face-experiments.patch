@@ -1,0 +1,446 @@
+diff --git a/.github/workflows/build.yml b/.github/workflows/build.yml
+new file mode 100644
+index 0000000..6287c76
+--- /dev/null
++++ b/.github/workflows/build.yml
+@@ -0,0 +1,44 @@
++# Builds the plugin, the server, the bot and the unit tests on a Windows runner (MSVC), runs the tests, and keeps
++# F4Multiplayer.dll (with its .pdb) as the run's artifact: Actions > Build > Run workflow, then download "F4Multiplayer"
++# from the finished run's page.
++name: Build
++
++on:
++  workflow_dispatch:
++  push:
++
++permissions:
++  contents: read
++
++jobs:
++  build:
++    runs-on: windows-latest
++    steps:
++      - name: Check out (with CommonLibF4)
++        uses: actions/checkout@v4
++        with:
++          submodules: recursive
++
++      - name: Set up xmake
++        uses: xmake-io/github-action-setup-xmake@v1
++        with:
++          xmake-version: latest
++
++      - name: Configure
++        run: xmake f -y -m releasedbg
++
++      - name: Build
++        run: xmake build -y
++
++      - name: Run the unit tests
++        timeout-minutes: 15  # a server test that deadlocks would otherwise hang the run
++        run: build\windows\x64\releasedbg\F4MPTests.exe
++
++      - name: Keep the plugin
++        uses: actions/upload-artifact@v4
++        with:
++          name: F4Multiplayer
++          path: |
++            build/windows/x64/releasedbg/F4Multiplayer.dll
++            build/windows/x64/releasedbg/F4Multiplayer.pdb
++          if-no-files-found: error
+diff --git a/dist/F4Multiplayer.ini b/dist/F4Multiplayer.ini
+index bb27e40..b205c19 100644
+--- a/dist/F4Multiplayer.ini
++++ b/dist/F4Multiplayer.ini
+@@ -63,6 +63,15 @@ iPuppetBaseForm = 0020A578
+ # stands headless for a few seconds, then gets the settler's face by itself), so leave it off.
+ bFriendFaces = false
+ 
++# With bFriendFaces = true: experimental tries at getting the engine to build that head (add up the
++# numbers, in hex). The log (F4Multiplayer.log, lines starting "Face:") says what each did.
++#   1  a rebuild asks for head and face by name, up to three times, each a different way
++#   2  the game's bUseFaceGenPreprocessedHeads is off while a stand-in waits for its head (heads
++#      built from their parts, not loaded from files; NPCs loading meanwhile may hitch a little)
++#   4  the copy is flagged as a character-creation face preset
++#   8  the copy and a headless stand-in's 3D tree go to the log (for finding out what's wrong)
++iFaceExperiment = 0B
++
+ # --- Shared world ----------------------------------------------------------
+ # Share quest progress (stages only move forward, and only once you've started the quest
+ # yourself). Side quests are shared whatever sStory says. Misc/radiant quests are never shared.
+diff --git a/src/Config.cpp b/src/Config.cpp
+index 174c309..a7abb65 100644
+--- a/src/Config.cpp
++++ b/src/Config.cpp
+@@ -102,6 +102,8 @@ namespace Config
+ 				ParseInt(value, settings.puppetBaseForm, 16);
+ 			} else if (key == "bFriendFaces") {
+ 				settings.friendFaces = ParseBool(value);
++			} else if (key == "iFaceExperiment") {
++				ParseInt(value, settings.faceExperiment, 16);
+ 			} else if (key == "bSyncQuests") {
+ 				settings.syncQuests = ParseBool(value);
+ 			} else if (key == "bRevive") {
+diff --git a/src/Config.h b/src/Config.h
+index 12e82d2..24849c1 100644
+--- a/src/Config.h
++++ b/src/Config.h
+@@ -47,6 +47,12 @@ namespace Config
+ 		// and body shape, as 0.8.7 showed everyone (and what a stand-in falls back to when the engine builds no head).
+ 		bool friendFaces = false;  // off: the engine built no head for a copy with its own head parts in every try (FaceWatch falls back)
+ 
++		// With bFriendFaces: which tries at getting the engine to build that head are made (bits; Face::kExp*). 1: a rebuild
++		// asks for head and face (up to three rebuilds); 2: the game's bUseFaceGenPreprocessedHeads is off while a stand-in
++		// waits for its head; 4: the copy is flagged as a character-creation face preset; 8: the copy and a headless
++		// stand-in's 3D go to the log.
++		std::uint32_t faceExperiment = 0x0B;
++
+ 		// Turn vsync off during loading screens so they finish faster.
+ 		bool fastLoading = true;
+ 
+diff --git a/src/game/Face.cpp b/src/game/Face.cpp
+index a1b522c..f8c2e4d 100644
+--- a/src/game/Face.cpp
++++ b/src/game/Face.cpp
+@@ -2,6 +2,7 @@
+ 
+ #include "Config.h"
+ #include "game/EngineRefs.h"
++#include "game/FaceWatch.h"
+ 
+ namespace Face
+ {
+@@ -18,6 +19,48 @@ namespace Face
+ 		// Which pieces to apply, when the dev set them (facemask); else the ini decides (Parts).
+ 		std::optional<std::uint32_t> parts;
+ 
++		// kExpRuntimeHeads: the game's setting, and its value from before we turned it off (empty: not ours to give back).
++		RE::Setting*        preprocessed = nullptr;
++		bool                preprocessedLookedUp = false;
++		std::optional<bool> preprocessedSaved;
++		std::uint32_t       runtimeSwitches = 0;
++
++		RE::Setting* PreprocessedHeads()
++		{
++			if (!preprocessedLookedUp) {
++				preprocessedLookedUp = true;
++				const auto setting = RE::GetINISetting("bUseFaceGenPreprocessedHeads:General");
++				if (setting && setting->GetType() == RE::Setting::SETTING_TYPE::kBinary) {
++					preprocessed = setting;
++					REX::INFO("Face: the game's bUseFaceGenPreprocessedHeads is {}", setting->GetBinary());
++				} else {
++					REX::WARN("Face: the game's bUseFaceGenPreprocessedHeads was not found; experiment 2 (runtime heads) does nothing");
++				}
++			}
++			return preprocessed;
++		}
++
++		// One line per node, as deep as a head sits under an actor's root (a few levels), and no more than a page of them.
++		void LogTree(const RE::NiAVObject* a_object, int a_depth, int& a_lines)
++		{
++			constexpr int MAX_DEPTH = 4;
++			constexpr int MAX_LINES = 80;
++			if (!a_object || a_lines >= MAX_LINES) {
++				return;
++			}
++			++a_lines;
++			const auto rtti = a_object->GetRTTI();
++			REX::INFO("Face:   {:{}}{} '{}'{}", "", a_depth * 2, rtti && rtti->GetName() ? rtti->GetName() : "?", a_object->GetName().c_str(),
++				a_object->GetAppCulled() ? " (culled)" : "");
++			const auto node = a_object->IsNode();
++			if (!node || a_depth >= MAX_DEPTH) {
++				return;
++			}
++			for (const auto& child : node->children) {
++				LogTree(child.get(), a_depth + 1, a_lines);
++			}
++		}
++
+ 		std::uint32_t IdOf(const RE::TESForm* a_form)
+ 		{
+ 			return a_form ? a_form->GetFormID() : 0;
+@@ -271,6 +314,18 @@ namespace Face
+ 		if (a_parts & kHeadParts) {
+ 			npc->faceNPC = nullptr;
+ 			npc->actorData.templateUseFlags.reset(RE::ACTOR_BASE_DATA::TEMPLATE_USE_FLAG::kTraits);
++			// Experiment 4: character-creation presets are NPCs whose heads the engine builds from their parts (the
++			// player is given one in the mirror), which is what this copy needs.
++			if (Experiments() & kExpChargenPreset) {
++				npc->actorData.actorBaseFlags.set(RE::ACTOR_BASE_DATA::Flag::kIsChargenFacePreset);
++			}
++		}
++		if (Experiments() & kExpDiagnostics) {
++			const auto file = npc->GetFile(0);
++			REX::INFO("Face: copy {:08X}: file '{}', faceNPC {:08X}, root face NPC {:08X}, base flags {:08X}, template flags {:04X}, {} head parts on it, head data {}, tints {}",
++				npc->GetFormID(), file ? file->GetFilename() : "none", IdOf(npc->faceNPC), IdOf(npc->GetRootFaceNPC()),
++				npc->actorData.actorBaseFlags.underlying(), npc->actorData.templateUseFlags.underlying(), static_cast<int>(npc->numHeadParts),
++				npc->headRelatedData != nullptr, npc->tintingData ? npc->tintingData->entriesA.size() : 0);
+ 		}
+ 		++made;
+ 		REX::INFO("Face: made base {:08X} from {:08X} with parts {:02X}: {} head parts, {} sliders, {} morphs, {} bones, {} tints{}", npc->GetFormID(), a_base->GetFormID(), a_parts,
+@@ -284,15 +339,80 @@ namespace Face
+ 		return a_actor && a_actor->Get3D() && a_actor->GetFaceNodeSkinned() != nullptr;
+ 	}
+ 
+-	void Rebuild(RE::Actor* a_actor)
++	std::uint32_t Experiments()
++	{
++		return Config::Get().faceExperiment;
++	}
++
++	int MaxRebuilds()
++	{
++		return (Experiments() & kExpRebuildHead) ? MAX_EXP_REBUILDS : FaceWatch::MAX_REBUILDS;
++	}
++
++	void Rebuild(RE::Actor* a_actor, int a_try)
+ 	{
+ 		if (!a_actor) {
+ 			return;
+ 		}
+ 		++rebuilds;
+-		// Everything built again on the engine's next update of it (queued, not from inside our frame), head included:
+-		// LooksMenu asks the same after editing an NPC's face.
+-		a_actor->Reset3D(true, 0, true, 0);
++		if (!(Experiments() & kExpRebuildHead)) {
++			// Everything built again on the engine's next update of it (queued, not from inside our frame), head included:
++			// LooksMenu asks the same after editing an NPC's face.
++			a_actor->Reset3D(true, 0, true, 0);
++			return;
++		}
++		// Experiment 1: head and face asked for by name (as for our own head in RepairOurs, and as tools that rebuild an
++		// NPC's face do), each try a different way: everything with them, then only them, then everything again with
++		// the skin too.
++		constexpr auto head = static_cast<std::uint32_t>(std::to_underlying(RE::RESET_3D_FLAGS::kHead) | std::to_underlying(RE::RESET_3D_FLAGS::kFace));
++		constexpr auto skin = static_cast<std::uint32_t>(std::to_underlying(RE::RESET_3D_FLAGS::kSkin));
++		switch (a_try) {
++		case 1:
++			a_actor->Reset3D(true, head, true, 0);
++			break;
++		case 2:
++			a_actor->Reset3D(false, head, true, 0);
++			break;
++		default:
++			a_actor->Reset3D(true, head | skin, true, 0);
++			break;
++		}
++		REX::INFO("Face: rebuild {} of {:08X} asked with flags {:02X} ({})", a_try, a_actor->GetFormID(), a_try == 1 || a_try == 2 ? head : head | skin,
++			a_try == 2 ? "head and face only" : "everything");
++	}
++
++	void RuntimeHeads(bool a_waiting)
++	{
++		const bool wanted = a_waiting && (Experiments() & kExpRuntimeHeads);
++		if (wanted == preprocessedSaved.has_value()) {
++			return;  // already as wanted
++		}
++		const auto setting = PreprocessedHeads();
++		if (!setting) {
++			return;
++		}
++		++runtimeSwitches;
++		if (wanted) {
++			preprocessedSaved = setting->GetBinary();
++			setting->SetBinary(false);
++			REX::INFO("Face: a stand-in waits for its own head; the game's bUseFaceGenPreprocessedHeads is off meanwhile (was {})", *preprocessedSaved);
++		} else {
++			setting->SetBinary(*preprocessedSaved);
++			REX::INFO("Face: no stand-in waits for its head; the game's bUseFaceGenPreprocessedHeads is back to {}", *preprocessedSaved);
++			preprocessedSaved.reset();
++		}
++	}
++
++	void LogHeadless(RE::Actor* a_actor, std::uint32_t a_playerId)
++	{
++		if (!a_actor || !(Experiments() & kExpDiagnostics)) {
++			return;
++		}
++		const auto base = a_actor->GetNPC();
++		REX::INFO("Face: player {}'s stand-in {:08X} (base {:08X}, root face NPC {:08X}) has no face node; its 3D:", a_playerId, a_actor->GetFormID(), IdOf(base),
++			IdOf(base ? base->GetRootFaceNPC() : nullptr));
++		int lines = 0;
++		LogTree(a_actor->Get3D(), 0, lines);
+ 	}
+ 
+ 	void GaveUp(std::uint32_t a_playerId, bool a_ours)
+@@ -320,6 +440,7 @@ namespace Face
+ 
+ 	std::string Describe()
+ 	{
+-		return std::format("faces: parts={:02X} made={} rejected={} rebuilds={} gaveup={}/{} repairs={}", Parts(), made, rejected, rebuilds, gaveUpNoHead, gaveUpOurs, repairs);
++		return std::format("faces: parts={:02X} exp={:X} made={} rejected={} rebuilds={} gaveup={}/{} repairs={} runtime={}/{}", Parts(), Experiments(), made, rejected, rebuilds,
++			gaveUpNoHead, gaveUpOurs, repairs, preprocessedSaved.has_value() ? "on" : "off", runtimeSwitches);
+ 	}
+ }
+diff --git a/src/game/Face.h b/src/game/Face.h
+index 31ebeb0..d473060 100644
+--- a/src/game/Face.h
++++ b/src/game/Face.h
+@@ -34,10 +34,30 @@ namespace Face
+ 	// Null if the race differs from a_base's or the game can't make the copy.
+ 	[[nodiscard]] RE::TESNPC* MakeBase(RE::TESNPC* a_base, const Protocol::Face& a_face, std::uint32_t a_parts);
+ 
++	// Tries at getting the engine to build a friend's own head (iFaceExperiment, a mask). Experimental: each says in the
++	// log what it did, so a session's log tells which of them gave the stand-in a head.
++	inline constexpr std::uint32_t kExpRebuildHead = 1;    // a rebuild asks for head and face by name, up to MAX_EXP_REBUILDS times
++	inline constexpr std::uint32_t kExpRuntimeHeads = 2;   // the game's bUseFaceGenPreprocessedHeads off while a stand-in waits for its head
++	inline constexpr std::uint32_t kExpChargenPreset = 4;  // the copy flagged as a character-creation face preset
++	inline constexpr std::uint32_t kExpDiagnostics = 8;    // the copy's face fields and a headless stand-in's 3D tree in the log
++	inline constexpr int           MAX_EXP_REBUILDS = 3;
++
++	// The tries made (iFaceExperiment).
++	[[nodiscard]] std::uint32_t Experiments();
++	// How many rebuilds FaceWatch asks for one stand-in before giving its head up.
++	[[nodiscard]] int MaxRebuilds();
++
+ 	// Whether an actor's loaded 3D has a face (head) on it.
+ 	[[nodiscard]] bool HasHead(RE::TESObjectREFR* a_actor);
+ 	// Asks the engine to build a stand-in's 3D again, head included, the way it does after an NPC's face is edited.
+-	void Rebuild(RE::Actor* a_actor);
++	// a_try is the rebuild's number for this stand-in (1 = the first), so later tries can ask differently.
++	void Rebuild(RE::Actor* a_actor, int a_try = 1);
++	// kExpRuntimeHeads: whether some stand-in waits for the engine to build its own head this frame. While one does,
++	// the game's bUseFaceGenPreprocessedHeads is off (heads built from their parts, not loaded from FaceGen files);
++	// with none, it is back as the player's ini has it. Called once a frame (and before placing such a stand-in).
++	void RuntimeHeads(bool a_waiting);
++	// kExpDiagnostics: what a stand-in that has no head has on it, for the log.
++	void LogHeadless(RE::Actor* a_actor, std::uint32_t a_playerId);
+ 	// A friend's own head was given up here (FaceWatch), for the log and the status.
+ 	void GaveUp(std::uint32_t a_playerId, bool a_ours);
+ 	// Asks the engine to build our own player's head again (after a stand-in's took it).
+diff --git a/src/game/FaceWatch.h b/src/game/FaceWatch.h
+index 55eb1fe..29ee168 100644
+--- a/src/game/FaceWatch.h
++++ b/src/game/FaceWatch.h
+@@ -84,7 +84,8 @@ namespace FaceWatch
+ 		a_standIn.since = a_now;
+ 	}
+ 
+-	inline Outcome Frame(StandIn& a_standIn, const Facts& a_facts, Clock::time_point a_now)
++	// a_maxRebuilds: how many rebuilds this stand-in is given before its head is given up (Face::MaxRebuilds).
++	inline Outcome Frame(StandIn& a_standIn, const Facts& a_facts, Clock::time_point a_now, int a_maxRebuilds = MAX_REBUILDS)
+ 	{
+ 		auto& s = a_standIn;
+ 		if (s.step == Step::kNone || s.step == Step::kGivenUp) {
+@@ -130,7 +131,7 @@ namespace FaceWatch
+ 			if (a_now - s.since < HEAD_WAIT) {
+ 				return {};
+ 			}
+-			if (s.rebuilds < MAX_REBUILDS) {
++			if (s.rebuilds < a_maxRebuilds) {
+ 				++s.rebuilds;
+ 				s.step = Step::kRebuilding;
+ 				s.since = a_now;
+@@ -142,6 +143,11 @@ namespace FaceWatch
+ 			if (a_now - s.since < HEAD_WAIT) {
+ 				return {};
+ 			}
++			if (s.rebuilds < a_maxRebuilds) {
++				++s.rebuilds;  // the 3D stayed loaded through it: the next try, asked differently (Face::Rebuild)
++				s.since = a_now;
++				return { Then::kRebuild, Why::kNoHead };
++			}
+ 			s.step = Step::kGivenUp;
+ 			return { Then::kGiveUp, Why::kNoHead };
+ 		default:
+diff --git a/src/game/RemotePlayers.cpp b/src/game/RemotePlayers.cpp
+index a2e30d4..456baa1 100644
+--- a/src/game/RemotePlayers.cpp
++++ b/src/game/RemotePlayers.cpp
+@@ -2394,6 +2394,9 @@ namespace RemotePlayers
+ 				placed.x = spot.x;
+ 				placed.y = spot.y;
+ 				placed.z = spot.z;
++				if (remote.faceOwnHead) {
++					Face::RuntimeHeads(true);  // experiment 2: before its 3D is queued, not a frame after
++				}
+ 				actor = Spawn(remote, placed, localCell);
+ 				if (!actor) {
+ 					continue;
+@@ -2432,13 +2435,20 @@ namespace RemotePlayers
+ 				facts.hasFace = facts.has3D && Face::HasHead(actor);
+ 				facts.busy = Equipment::InPowerArmor(actor) || remote.inPowerArmor;
+ 				facts.oursGone = oursGone;
+-				const auto outcome = FaceWatch::Frame(remote.faceWatch, facts, now);
++				const auto outcome = FaceWatch::Frame(remote.faceWatch, facts, now, Face::MaxRebuilds());
+ 				switch (outcome.then) {
+ 				case FaceWatch::Then::kRebuild:
+-					REX::INFO("RemotePlayers: player {} stand-in {:08X} loaded with no head on it; asked the engine to build its 3D again", remote.id, actor->GetFormID());
+-					Face::Rebuild(actor);
++					REX::INFO("RemotePlayers: player {} stand-in {:08X} loaded with no head on it; asked the engine to build its 3D again (try {})", remote.id, actor->GetFormID(),
++						remote.faceWatch.rebuilds);
++					if (remote.faceWatch.rebuilds == 1) {
++						Face::LogHeadless(actor, remote.id);
++					}
++					Face::Rebuild(actor, remote.faceWatch.rebuilds);
+ 					break;
+ 				case FaceWatch::Then::kGiveUp:
++					if (outcome.why == FaceWatch::Why::kNoHead && facts.has3D) {
++						Face::LogHeadless(actor, remote.id);  // what the last try left on it
++					}
+ 					Face::GaveUp(remote.id, outcome.why == FaceWatch::Why::kOurs);
+ 					if (outcome.why == FaceWatch::Why::kOurs) {
+ 						FaceWatch::TakenBy(ourHead, now);
+@@ -2528,6 +2538,17 @@ namespace RemotePlayers
+ 			});
+ 		}
+ 		KeepUsCalm(player, now);
++		// Experiment 2: the game builds heads from their parts while a placed stand-in waits for its own head.
++		bool faceWaiting = false;
++		for (const auto& [id, remote] : players) {
++			const auto step = remote.faceWatch.step;
++			if (remote.faceOwnHead && GetActor(remote) &&
++				(step == FaceWatch::Step::kLoading || step == FaceWatch::Step::kLoaded || step == FaceWatch::Step::kRebuilding)) {
++				faceWaiting = true;
++				break;
++			}
++		}
++		Face::RuntimeHeads(faceWaiting);
+ 		// Our head still gone a moment after the stand-in that took it went: asked back, once.
+ 		if (FaceWatch::RepairDue(ourHead, oursGone, now)) {
+ 			Face::RepairOurs();
+diff --git a/tests/FaceTests.cpp b/tests/FaceTests.cpp
+index 9dcb956..53d655f 100644
+--- a/tests/FaceTests.cpp
++++ b/tests/FaceTests.cpp
+@@ -302,3 +302,40 @@ TEST("face watch: our head is asked back once, only if still gone a moment after
+ 	FaceWatch::TakenBy(fresh, T0 + 20s);
+ 	CHECK(FaceWatch::RepairDue(fresh, true, T0 + 20s + OUR_REPAIR_WAIT));
+ }
++
++TEST("face watch: with more rebuilds allowed (experiment 1), each comes HEAD_WAIT after the last, loaded or reloaded")
++{
++	constexpr int MAX = 3;
++	FaceWatch::StandIn s;
++	FaceWatch::Placed(s, T0);
++	CHECK(FaceWatch::Frame(s, Loaded(false), T0, MAX).then == Then::kNothing);
++	CHECK(FaceWatch::Frame(s, Loaded(false), T0 + HEAD_WAIT, MAX).then == Then::kRebuild);
++	CHECK(s.rebuilds == 1);
++	// The second: its 3D stayed loaded through the first.
++	CHECK(FaceWatch::Frame(s, Loaded(false), T0 + 2 * HEAD_WAIT - 1ms, MAX).then == Then::kNothing);
++	CHECK(FaceWatch::Frame(s, Loaded(false), T0 + 2 * HEAD_WAIT, MAX).then == Then::kRebuild);
++	CHECK(s.rebuilds == 2);
++	// The third: its 3D went down and came back, still headless.
++	CHECK(FaceWatch::Frame(s, Facts{}, T0 + 2 * HEAD_WAIT + 100ms, MAX).then == Then::kNothing);
++	CHECK(FaceWatch::Frame(s, Loaded(false), T0 + 2 * HEAD_WAIT + 200ms, MAX).then == Then::kNothing);
++	CHECK(FaceWatch::Frame(s, Loaded(false), T0 + 3 * HEAD_WAIT + 200ms, MAX).then == Then::kRebuild);
++	CHECK(s.rebuilds == 3);
++	// Out of tries: given up.
++	const auto gaveUp = FaceWatch::Frame(s, Loaded(false), T0 + 4 * HEAD_WAIT + 200ms, MAX);
++	CHECK(gaveUp.then == Then::kGiveUp);
++	CHECK(gaveUp.why == Why::kNoHead);
++}
++
++TEST("face watch: with more rebuilds allowed, a head on the second try ends it")
++{
++	constexpr int MAX = 3;
++	FaceWatch::StandIn s;
++	FaceWatch::Placed(s, T0);
++	CHECK(FaceWatch::Frame(s, Loaded(false), T0, MAX).then == Then::kNothing);
++	CHECK(FaceWatch::Frame(s, Loaded(false), T0 + HEAD_WAIT, MAX).then == Then::kRebuild);
++	CHECK(FaceWatch::Frame(s, Loaded(false), T0 + 2 * HEAD_WAIT, MAX).then == Then::kRebuild);
++	CHECK(FaceWatch::Frame(s, Loaded(true), T0 + 2 * HEAD_WAIT + 1s, MAX).then == Then::kNothing);
++	CHECK(s.step == Step::kBuilt);
++	CHECK(FaceWatch::Frame(s, Loaded(true), T0 + 60s, MAX).then == Then::kNothing);
++	CHECK(s.rebuilds == 2);
++}

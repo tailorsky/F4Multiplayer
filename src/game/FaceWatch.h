@@ -84,7 +84,8 @@ namespace FaceWatch
 		a_standIn.since = a_now;
 	}
 
-	inline Outcome Frame(StandIn& a_standIn, const Facts& a_facts, Clock::time_point a_now)
+	// a_maxRebuilds: how many rebuilds this stand-in is given before its head is given up (Face::MaxRebuilds).
+	inline Outcome Frame(StandIn& a_standIn, const Facts& a_facts, Clock::time_point a_now, int a_maxRebuilds = MAX_REBUILDS)
 	{
 		auto& s = a_standIn;
 		if (s.step == Step::kNone || s.step == Step::kGivenUp) {
@@ -130,7 +131,7 @@ namespace FaceWatch
 			if (a_now - s.since < HEAD_WAIT) {
 				return {};
 			}
-			if (s.rebuilds < MAX_REBUILDS) {
+			if (s.rebuilds < a_maxRebuilds) {
 				++s.rebuilds;
 				s.step = Step::kRebuilding;
 				s.since = a_now;
@@ -141,6 +142,11 @@ namespace FaceWatch
 		case Step::kRebuilding:
 			if (a_now - s.since < HEAD_WAIT) {
 				return {};
+			}
+			if (s.rebuilds < a_maxRebuilds) {
+				++s.rebuilds;  // the 3D stayed loaded through it: the next try, asked differently (Face::Rebuild)
+				s.since = a_now;
+				return { Then::kRebuild, Why::kNoHead };
 			}
 			s.step = Step::kGivenUp;
 			return { Then::kGiveUp, Why::kNoHead };

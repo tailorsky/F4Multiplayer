@@ -2394,6 +2394,9 @@ namespace RemotePlayers
 				placed.x = spot.x;
 				placed.y = spot.y;
 				placed.z = spot.z;
+				if (remote.faceOwnHead) {
+					Face::RuntimeHeads(true);  // experiment 2: before its 3D is queued, not a frame after
+				}
 				actor = Spawn(remote, placed, localCell);
 				if (!actor) {
 					continue;
@@ -2432,13 +2435,20 @@ namespace RemotePlayers
 				facts.hasFace = facts.has3D && Face::HasHead(actor);
 				facts.busy = Equipment::InPowerArmor(actor) || remote.inPowerArmor;
 				facts.oursGone = oursGone;
-				const auto outcome = FaceWatch::Frame(remote.faceWatch, facts, now);
+				const auto outcome = FaceWatch::Frame(remote.faceWatch, facts, now, Face::MaxRebuilds());
 				switch (outcome.then) {
 				case FaceWatch::Then::kRebuild:
-					REX::INFO("RemotePlayers: player {} stand-in {:08X} loaded with no head on it; asked the engine to build its 3D again", remote.id, actor->GetFormID());
-					Face::Rebuild(actor);
+					REX::INFO("RemotePlayers: player {} stand-in {:08X} loaded with no head on it; asked the engine to build its 3D again (try {})", remote.id, actor->GetFormID(),
+						remote.faceWatch.rebuilds);
+					if (remote.faceWatch.rebuilds == 1) {
+						Face::LogHeadless(actor, remote.id);
+					}
+					Face::Rebuild(actor, remote.faceWatch.rebuilds);
 					break;
 				case FaceWatch::Then::kGiveUp:
+					if (outcome.why == FaceWatch::Why::kNoHead && facts.has3D) {
+						Face::LogHeadless(actor, remote.id);  // what the last try left on it
+					}
 					Face::GaveUp(remote.id, outcome.why == FaceWatch::Why::kOurs);
 					if (outcome.why == FaceWatch::Why::kOurs) {
 						FaceWatch::TakenBy(ourHead, now);
@@ -2528,6 +2538,17 @@ namespace RemotePlayers
 			});
 		}
 		KeepUsCalm(player, now);
+		// Experiment 2: the game builds heads from their parts while a placed stand-in waits for its own head.
+		bool faceWaiting = false;
+		for (const auto& [id, remote] : players) {
+			const auto step = remote.faceWatch.step;
+			if (remote.faceOwnHead && GetActor(remote) &&
+				(step == FaceWatch::Step::kLoading || step == FaceWatch::Step::kLoaded || step == FaceWatch::Step::kRebuilding)) {
+				faceWaiting = true;
+				break;
+			}
+		}
+		Face::RuntimeHeads(faceWaiting);
 		// Our head still gone a moment after the stand-in that took it went: asked back, once.
 		if (FaceWatch::RepairDue(ourHead, oursGone, now)) {
 			Face::RepairOurs();

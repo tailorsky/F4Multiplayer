@@ -34,10 +34,30 @@ namespace Face
 	// Null if the race differs from a_base's or the game can't make the copy.
 	[[nodiscard]] RE::TESNPC* MakeBase(RE::TESNPC* a_base, const Protocol::Face& a_face, std::uint32_t a_parts);
 
+	// Tries at getting the engine to build a friend's own head (iFaceExperiment, a mask). Experimental: each says in the
+	// log what it did, so a session's log tells which of them gave the stand-in a head.
+	inline constexpr std::uint32_t kExpRebuildHead = 1;    // a rebuild asks for head and face by name, up to MAX_EXP_REBUILDS times
+	inline constexpr std::uint32_t kExpRuntimeHeads = 2;   // the game's bUseFaceGenPreprocessedHeads off while a stand-in waits for its head
+	inline constexpr std::uint32_t kExpChargenPreset = 4;  // the copy flagged as a character-creation face preset
+	inline constexpr std::uint32_t kExpDiagnostics = 8;    // the copy's face fields and a headless stand-in's 3D tree in the log
+	inline constexpr int           MAX_EXP_REBUILDS = 3;
+
+	// The tries made (iFaceExperiment).
+	[[nodiscard]] std::uint32_t Experiments();
+	// How many rebuilds FaceWatch asks for one stand-in before giving its head up.
+	[[nodiscard]] int MaxRebuilds();
+
 	// Whether an actor's loaded 3D has a face (head) on it.
 	[[nodiscard]] bool HasHead(RE::TESObjectREFR* a_actor);
 	// Asks the engine to build a stand-in's 3D again, head included, the way it does after an NPC's face is edited.
-	void Rebuild(RE::Actor* a_actor);
+	// a_try is the rebuild's number for this stand-in (1 = the first), so later tries can ask differently.
+	void Rebuild(RE::Actor* a_actor, int a_try = 1);
+	// kExpRuntimeHeads: whether some stand-in waits for the engine to build its own head this frame. While one does,
+	// the game's bUseFaceGenPreprocessedHeads is off (heads built from their parts, not loaded from FaceGen files);
+	// with none, it is back as the player's ini has it. Called once a frame (and before placing such a stand-in).
+	void RuntimeHeads(bool a_waiting);
+	// kExpDiagnostics: what a stand-in that has no head has on it, for the log.
+	void LogHeadless(RE::Actor* a_actor, std::uint32_t a_playerId);
 	// A friend's own head was given up here (FaceWatch), for the log and the status.
 	void GaveUp(std::uint32_t a_playerId, bool a_ours);
 	// Asks the engine to build our own player's head again (after a stand-in's took it).

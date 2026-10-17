@@ -47,6 +47,12 @@ namespace Config
 		// and body shape, as 0.8.7 showed everyone (and what a stand-in falls back to when the engine builds no head).
 		bool friendFaces = false;  // off: the engine built no head for a copy with its own head parts in every try (FaceWatch falls back)
 
+		// With bFriendFaces: which tries at getting the engine to build that head are made (bits; Face::kExp*). 1: a rebuild
+		// asks for head and face (up to three rebuilds); 2: the game's bUseFaceGenPreprocessedHeads is off while a stand-in
+		// waits for its head; 4: the copy is flagged as a character-creation face preset; 8: the copy and a headless
+		// stand-in's 3D go to the log.
+		std::uint32_t faceExperiment = 0x0B;
+
 		// Turn vsync off during loading screens so they finish faster.
 		bool fastLoading = true;
 

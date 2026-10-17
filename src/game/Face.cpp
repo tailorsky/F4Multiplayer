@@ -2,6 +2,7 @@
 
 #include "Config.h"
 #include "game/EngineRefs.h"
+#include "game/FaceWatch.h"
 
 namespace Face
 {
@@ -17,6 +18,48 @@ namespace Face
 		std::uint32_t repairs = 0;
 		// Which pieces to apply, when the dev set them (facemask); else the ini decides (Parts).
 		std::optional<std::uint32_t> parts;
+
+		// kExpRuntimeHeads: the game's setting, and its value from before we turned it off (empty: not ours to give back).
+		RE::Setting*        preprocessed = nullptr;
+		bool                preprocessedLookedUp = false;
+		std::optional<bool> preprocessedSaved;
+		std::uint32_t       runtimeSwitches = 0;
+
+		RE::Setting* PreprocessedHeads()
+		{
+			if (!preprocessedLookedUp) {
+				preprocessedLookedUp = true;
+				const auto setting = RE::GetINISetting("bUseFaceGenPreprocessedHeads:General");
+				if (setting && setting->GetType() == RE::Setting::SETTING_TYPE::kBinary) {
+					preprocessed = setting;
+					REX::INFO("Face: the game's bUseFaceGenPreprocessedHeads is {}", setting->GetBinary());
+				} else {
+					REX::WARN("Face: the game's bUseFaceGenPreprocessedHeads was not found; experiment 2 (runtime heads) does nothing");
+				}
+			}
+			return preprocessed;
+		}
+
+		// One line per node, as deep as a head sits under an actor's root (a few levels), and no more than a page of them.
+		void LogTree(const RE::NiAVObject* a_object, int a_depth, int& a_lines)
+		{
+			constexpr int MAX_DEPTH = 4;
+			constexpr int MAX_LINES = 80;
+			if (!a_object || a_lines >= MAX_LINES) {
+				return;
+			}
+			++a_lines;
+			const auto rtti = a_object->GetRTTI();
+			REX::INFO("Face:   {:{}}{} '{}'{}", "", a_depth * 2, rtti && rtti->GetName() ? rtti->GetName() : "?", a_object->GetName().c_str(),
+				a_object->GetAppCulled() ? " (culled)" : "");
+			const auto node = a_object->IsNode();
+			if (!node || a_depth >= MAX_DEPTH) {
+				return;
+			}
+			for (const auto& child : node->children) {
+				LogTree(child.get(), a_depth + 1, a_lines);
+			}
+		}
 
 		std::uint32_t IdOf(const RE::TESForm* a_form)
 		{
@@ -271,6 +314,18 @@ namespace Face
 		if (a_parts & kHeadParts) {
 			npc->faceNPC = nullptr;
 			npc->actorData.templateUseFlags.reset(RE::ACTOR_BASE_DATA::TEMPLATE_USE_FLAG::kTraits);
+			// Experiment 4: character-creation presets are NPCs whose heads the engine builds from their parts (the
+			// player is given one in the mirror), which is what this copy needs.
+			if (Experiments() & kExpChargenPreset) {
+				npc->actorData.actorBaseFlags.set(RE::ACTOR_BASE_DATA::Flag::kIsChargenFacePreset);
+			}
+		}
+		if (Experiments() & kExpDiagnostics) {
+			const auto file = npc->GetFile(0);
+			REX::INFO("Face: copy {:08X}: file '{}', faceNPC {:08X}, root face NPC {:08X}, base flags {:08X}, template flags {:04X}, {} head parts on it, head data {}, tints {}",
+				npc->GetFormID(), file ? file->GetFilename() : "none", IdOf(npc->faceNPC), IdOf(npc->GetRootFaceNPC()),
+				npc->actorData.actorBaseFlags.underlying(), npc->actorData.templateUseFlags.underlying(), static_cast<int>(npc->numHeadParts),
+				npc->headRelatedData != nullptr, npc->tintingData ? npc->tintingData->entriesA.size() : 0);
 		}
 		++made;
 		REX::INFO("Face: made base {:08X} from {:08X} with parts {:02X}: {} head parts, {} sliders, {} morphs, {} bones, {} tints{}", npc->GetFormID(), a_base->GetFormID(), a_parts,
@@ -284,15 +339,80 @@ namespace Face
 		return a_actor && a_actor->Get3D() && a_actor->GetFaceNodeSkinned() != nullptr;
 	}
 
-	void Rebuild(RE::Actor* a_actor)
+	std::uint32_t Experiments()
+	{
+		return Config::Get().faceExperiment;
+	}
+
+	int MaxRebuilds()
+	{
+		return (Experiments() & kExpRebuildHead) ? MAX_EXP_REBUILDS : FaceWatch::MAX_REBUILDS;
+	}
+
+	void Rebuild(RE::Actor* a_actor, int a_try)
 	{
 		if (!a_actor) {
 			return;
 		}
 		++rebuilds;
-		// Everything built again on the engine's next update of it (queued, not from inside our frame), head included:
-		// LooksMenu asks the same after editing an NPC's face.
-		a_actor->Reset3D(true, 0, true, 0);
+		if (!(Experiments() & kExpRebuildHead)) {
+			// Everything built again on the engine's next update of it (queued, not from inside our frame), head included:
+			// LooksMenu asks the same after editing an NPC's face.
+			a_actor->Reset3D(true, 0, true, 0);
+			return;
+		}
+		// Experiment 1: head and face asked for by name (as for our own head in RepairOurs, and as tools that rebuild an
+		// NPC's face do), each try a different way: everything with them, then only them, then everything again with
+		// the skin too.
+		constexpr auto head = static_cast<std::uint32_t>(std::to_underlying(RE::RESET_3D_FLAGS::kHead) | std::to_underlying(RE::RESET_3D_FLAGS::kFace));
+		constexpr auto skin = static_cast<std::uint32_t>(std::to_underlying(RE::RESET_3D_FLAGS::kSkin));
+		switch (a_try) {
+		case 1:
+			a_actor->Reset3D(true, head, true, 0);
+			break;
+		case 2:
+			a_actor->Reset3D(false, head, true, 0);
+			break;
+		default:
+			a_actor->Reset3D(true, head | skin, true, 0);
+			break;
+		}
+		REX::INFO("Face: rebuild {} of {:08X} asked with flags {:02X} ({})", a_try, a_actor->GetFormID(), a_try == 1 || a_try == 2 ? head : head | skin,
+			a_try == 2 ? "head and face only" : "everything");
+	}
+
+	void RuntimeHeads(bool a_waiting)
+	{
+		const bool wanted = a_waiting && (Experiments() & kExpRuntimeHeads);
+		if (wanted == preprocessedSaved.has_value()) {
+			return;  // already as wanted
+		}
+		const auto setting = PreprocessedHeads();
+		if (!setting) {
+			return;
+		}
+		++runtimeSwitches;
+		if (wanted) {
+			preprocessedSaved = setting->GetBinary();
+			setting->SetBinary(false);
+			REX::INFO("Face: a stand-in waits for its own head; the game's bUseFaceGenPreprocessedHeads is off meanwhile (was {})", *preprocessedSaved);
+		} else {
+			setting->SetBinary(*preprocessedSaved);
+			REX::INFO("Face: no stand-in waits for its head; the game's bUseFaceGenPreprocessedHeads is back to {}", *preprocessedSaved);
+			preprocessedSaved.reset();
+		}
+	}
+
+	void LogHeadless(RE::Actor* a_actor, std::uint32_t a_playerId)
+	{
+		if (!a_actor || !(Experiments() & kExpDiagnostics)) {
+			return;
+		}
+		const auto base = a_actor->GetNPC();
+		REX::INFO("Face: player {}'s stand-in {:08X} (base {:08X}, root face NPC {:08X}) has no face node; its 3D:", a_playerId, a_actor->GetFormID(), IdOf(base),
+			IdOf(base ? base->GetRootFaceNPC() : nullptr));
+		int lines = 0;
+		LogTree(a_actor->Get3D(), 0, lines);
 	}
 
 	void GaveUp(std::uint32_t a_playerId, bool a_ours)
@@ -320,6 +440,7 @@ namespace Face
 
 	std::string Describe()
 	{
-		return std::format("faces: parts={:02X} made={} rejected={} rebuilds={} gaveup={}/{} repairs={}", Parts(), made, rejected, rebuilds, gaveUpNoHead, gaveUpOurs, repairs);
+		return std::format("faces: parts={:02X} exp={:X} made={} rejected={} rebuilds={} gaveup={}/{} repairs={} runtime={}/{}", Parts(), Experiments(), made, rejected, rebuilds,
+			gaveUpNoHead, gaveUpOurs, repairs, preprocessedSaved.has_value() ? "on" : "off", runtimeSwitches);
 	}
 }

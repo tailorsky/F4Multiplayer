@@ -302,3 +302,40 @@ TEST("face watch: our head is asked back once, only if still gone a moment after
 	FaceWatch::TakenBy(fresh, T0 + 20s);
 	CHECK(FaceWatch::RepairDue(fresh, true, T0 + 20s + OUR_REPAIR_WAIT));
 }
+
+TEST("face watch: with more rebuilds allowed (experiment 1), each comes HEAD_WAIT after the last, loaded or reloaded")
+{
+	constexpr int MAX = 3;
+	FaceWatch::StandIn s;
+	FaceWatch::Placed(s, T0);
+	CHECK(FaceWatch::Frame(s, Loaded(false), T0, MAX).then == Then::kNothing);
+	CHECK(FaceWatch::Frame(s, Loaded(false), T0 + HEAD_WAIT, MAX).then == Then::kRebuild);
+	CHECK(s.rebuilds == 1);
+	// The second: its 3D stayed loaded through the first.
+	CHECK(FaceWatch::Frame(s, Loaded(false), T0 + 2 * HEAD_WAIT - 1ms, MAX).then == Then::kNothing);
+	CHECK(FaceWatch::Frame(s, Loaded(false), T0 + 2 * HEAD_WAIT, MAX).then == Then::kRebuild);
+	CHECK(s.rebuilds == 2);
+	// The third: its 3D went down and came back, still headless.
+	CHECK(FaceWatch::Frame(s, Facts{}, T0 + 2 * HEAD_WAIT + 100ms, MAX).then == Then::kNothing);
+	CHECK(FaceWatch::Frame(s, Loaded(false), T0 + 2 * HEAD_WAIT + 200ms, MAX).then == Then::kNothing);
+	CHECK(FaceWatch::Frame(s, Loaded(false), T0 + 3 * HEAD_WAIT + 200ms, MAX).then == Then::kRebuild);
+	CHECK(s.rebuilds == 3);
+	// Out of tries: given up.
+	const auto gaveUp = FaceWatch::Frame(s, Loaded(false), T0 + 4 * HEAD_WAIT + 200ms, MAX);
+	CHECK(gaveUp.then == Then::kGiveUp);
+	CHECK(gaveUp.why == Why::kNoHead);
+}
+
+TEST("face watch: with more rebuilds allowed, a head on the second try ends it")
+{
+	constexpr int MAX = 3;
+	FaceWatch::StandIn s;
+	FaceWatch::Placed(s, T0);
+	CHECK(FaceWatch::Frame(s, Loaded(false), T0, MAX).then == Then::kNothing);
+	CHECK(FaceWatch::Frame(s, Loaded(false), T0 + HEAD_WAIT, MAX).then == Then::kRebuild);
+	CHECK(FaceWatch::Frame(s, Loaded(false), T0 + 2 * HEAD_WAIT, MAX).then == Then::kRebuild);
+	CHECK(FaceWatch::Frame(s, Loaded(true), T0 + 2 * HEAD_WAIT + 1s, MAX).then == Then::kNothing);
+	CHECK(s.step == Step::kBuilt);
+	CHECK(FaceWatch::Frame(s, Loaded(true), T0 + 60s, MAX).then == Then::kNothing);
+	CHECK(s.rebuilds == 2);
+}
