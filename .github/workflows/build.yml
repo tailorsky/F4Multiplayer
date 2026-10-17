@@ -1,0 +1,38 @@
+name: Build
+
+on:
+  workflow_dispatch:
+  push:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: xmake-io/github-action-setup-xmake@v1
+        with:
+          xmake-version: latest
+
+      - name: Configure
+        run: xmake f -y -m releasedbg
+
+      - name: Build
+        run: xmake build -y
+
+      - name: Run the unit tests
+        timeout-minutes: 15
+        run: build\windows\x64\releasedbg\F4MPTests.exe
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: F4Multiplayer
+          path: |
+            build/windows/x64/releasedbg/F4Multiplayer.dll
+            build/windows/x64/releasedbg/F4Multiplayer.pdb
+          if-no-files-found: error
